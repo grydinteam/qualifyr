@@ -508,6 +508,18 @@ class Database:
         )
         self._commit()
 
+    @staticmethod
+    def _lead_or_none(data_json: str, lead_id: str = "?") -> Lead | None:
+        """Deserialize one stored lead blob, returning None (logged) instead of raising if the
+        blob predates a schema change in a way defaults can't absorb or is corrupt. Used by the
+        LIST paths so one unreadable row can't 500 the whole leads page or export; a run can
+        always re-derive a lead, so skipping a stale one is safer than failing the request."""
+        try:
+            return Lead.model_validate_json(data_json)
+        except Exception as exc:  # noqa: BLE001 - any validation/parse error: skip, don't crash
+            log.warning("skipping unreadable lead blob %s: %s", lead_id, exc)
+            return None
+
     def get_lead(self, lead_id: str) -> Lead | None:
         row = self._execute("SELECT data_json FROM leads WHERE lead_id = %s", (lead_id,)).fetchone()
         return Lead.model_validate_json(row["data_json"]) if row else None
@@ -531,7 +543,7 @@ class Database:
             sql += " LIMIT %s OFFSET %s"
             params.extend([limit, offset])
         rows = self._execute(sql, params).fetchall()
-        return [Lead.model_validate_json(r["data_json"]) for r in rows]
+        return [l for r in rows if (l := self._lead_or_none(r["data_json"])) is not None]
 
     def count_leads(self, campaign_id: str, *, min_score: int | None = None,
                     company_type: str | None = None,
@@ -574,7 +586,7 @@ class Database:
             f"SELECT data_json FROM leads WHERE campaign_id = %s AND sequence_status IN ({placeholders}) "
             "ORDER BY total_score DESC", [campaign_id, *statuses]
         ).fetchall()
-        return [Lead.model_validate_json(r["data_json"]) for r in rows]
+        return [l for r in rows if (l := self._lead_or_none(r["data_json"])) is not None]
 
     def campaign_config(self, campaign_id: str) -> dict | None:
         row = self._execute(

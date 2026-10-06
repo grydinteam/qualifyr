@@ -154,8 +154,9 @@ function Shell({ children }: { children: React.ReactNode }) {
       <div className="flex flex-1 flex-col">
         <header className="sticky top-0 z-10 flex h-16 items-center gap-4 border-b bg-card px-6">
           <Sheet open={open} onOpenChange={setOpen}>
-            <SheetTrigger className="lg:hidden">
+            <SheetTrigger className="lg:hidden" aria-label="Open navigation menu">
               <Menu className="size-5" />
+              <span className="sr-only">Open navigation menu</span>
             </SheetTrigger>
             <SheetContent side="left" className="w-72 p-0">
               <SheetHeader className="sr-only"><SheetTitle>Navigation</SheetTitle></SheetHeader>

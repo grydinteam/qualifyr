@@ -507,6 +507,17 @@ class Pipeline:
         async with self._db_lock:
             return await asyncio.to_thread(fn, *args, **kwargs)
 
+    def _claim_budget(self, name: str) -> bool:
+        """Atomically take one unit from a per-run budget (e.g. "places", "news"). Check and
+        decrement happen together with no await between, so a future edit can't split them and
+        let two concurrent workers both pass the check and overspend the budget."""
+        attr = f"_{name}_budget"
+        remaining = getattr(self, attr)
+        if remaining > 0:
+            setattr(self, attr, remaining - 1)
+            return True
+        return False
+
     async def discover(self, campaign: CampaignConfig, progress: ProgressFn | None = None) -> list[DiscoveredCompany]:
         sources = []
         if campaign.overture_categories and campaign.geography.search_areas():
@@ -545,8 +556,7 @@ class Pipeline:
         """Returns None when the company turns out to duplicate one already processed
         in this run (its website, found by search, belongs to an earlier company)."""
         website = company.website
-        if not website and self._website_finder_budget > 0:
-            self._website_finder_budget -= 1
+        if not website and self._claim_budget("website_finder"):
             website = await self.website_finder.find(company.name, company.city, company.country)
             if website:
                 company = company.model_copy(update={"website": website, "domain": canonical_domain(website),
@@ -623,8 +633,7 @@ class Pipeline:
         if (self.settings.enable_places_enrichment
                 and places_key
                 and cls.company_type == CompanyType.BUYER
-                and self._places_budget > 0):
-            self._places_budget -= 1
+                and self._claim_budget("places")):
             stats.places_api_calls += 1
             places = await places_enrichment(
                 self.fetcher, company.name,
@@ -748,8 +757,7 @@ class Pipeline:
                 if age:
                     signals.domain_age_years, signals.domain_age_note = age.years, age.note or None
                     provenance["domain_age"] = f"{age.source}: {age.note or f'registered {age.registered:%Y-%m-%d}'}"
-            if self.settings.enable_news_signals and self._news_budget > 0:
-                self._news_budget -= 1
+            if self.settings.enable_news_signals and self._claim_budget("news"):
                 mentions = await self.news.mentions(company.name, company.country or "Pakistan")
                 if mentions:
                     signals.news = [m.__dict__ for m in mentions]
@@ -757,8 +765,7 @@ class Pipeline:
                     provenance["news"] = f"gdelt: {len(mentions)} article(s), latest {mentions[0].date}"
 
             # GTM intelligence: job-board postings, GitHub activity, press/RSS mentions.
-            if self.settings.enable_job_board_signals and self._job_board_budget > 0:
-                self._job_board_budget -= 1
+            if self.settings.enable_job_board_signals and self._claim_budget("job_board"):
                 jb = await job_board_signals(self.fetcher, company.name, domain, self.defaults)
                 if jb.postings:
                     signals.job_openings = [p.__dict__ for p in jb.postings]
@@ -768,8 +775,7 @@ class Pipeline:
                         f"{len(jb.postings)} open role(s) on {jb.board} ({label})")
                     provenance["job_openings"] = f"{jb.board}: {len(jb.postings)} posting(s), slug '{jb.slug}'"
 
-            if self.settings.enable_github_signals and self._github_budget > 0:
-                self._github_budget -= 1
+            if self.settings.enable_github_signals and self._claim_budget("github"):
                 gh = await github_activity(self.fetcher, company.name, domain)
                 if gh:
                     signals.github_activity = gh.__dict__
@@ -777,8 +783,7 @@ class Pipeline:
                         f"{gh.public_repos} public repo(s), last pushed {gh.last_pushed_at}")
                     provenance["github_activity"] = f"github: org '{gh.org}', {gh.public_repos} repo(s)"
 
-            if self.settings.enable_press_signals and self._press_budget > 0:
-                self._press_budget -= 1
+            if self.settings.enable_press_signals and self._claim_budget("press"):
                 press = await press_mentions(self.fetcher, snapshot.final_url or website, self.defaults)
                 if press:
                     signals.press_mentions = [p.__dict__ for p in press]

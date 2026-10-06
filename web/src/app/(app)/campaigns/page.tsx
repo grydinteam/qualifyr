@@ -679,8 +679,12 @@ export default function CampaignsPage() {
         return (
           <Card
             key={c.campaign_id}
-            className="overflow-hidden cursor-pointer select-none transition-all hover:border-primary/30 hover:shadow-md"
+            className="overflow-hidden cursor-pointer select-none transition-all hover:border-primary/30 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             onClick={() => openLeads(c.campaign_id)}
+            role="button"
+            tabIndex={0}
+            aria-label={`View leads for ${c.name}`}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openLeads(c.campaign_id) } }}
             title="View leads for this campaign"
           >
             <CardContent className="flex flex-col gap-4 p-5">
