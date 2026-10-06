@@ -8,7 +8,10 @@ from gtm_engine.scraping.fetcher import HttpFetcher, _is_blocked_ip_literal
 
 def test_blocks_non_public_ip_literals():
     for host in ["169.254.169.254", "127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1",
-                 "::1", "0.0.0.0", "fd00::1"]:
+                 "::1", "0.0.0.0", "fd00::1",
+                 # IPv6-mapped IPv4: the mapped form's own is_loopback/is_private are False on
+                 # older Python, so these must be unwrapped and blocked by the embedded IPv4.
+                 "::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.1"]:
         assert _is_blocked_ip_literal(host), f"{host} should be blocked"
 
 

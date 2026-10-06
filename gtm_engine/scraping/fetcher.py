@@ -8,6 +8,7 @@ import asyncio
 import ipaddress
 import logging
 import re
+import socket
 import time
 from dataclasses import dataclass
 from typing import Protocol
@@ -23,17 +24,27 @@ log = logging.getLogger(__name__)
 _RETRYABLE = {408, 425, 429, 500, 502, 503, 504}
 
 
+def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True when this IP is in a non-public range (loopback, private, link-local, reserved,
+    multicast, unspecified)."""
+    # Unwrap IPv6-mapped IPv4 (e.g. ::ffff:127.0.0.1) and check the embedded IPv4 against the
+    # ranges below. The mapped form's own is_loopback/is_private are False on Python < 3.13, so
+    # without this unwrap `::ffff:127.0.0.1` sails through the guard and httpx connects to
+    # loopback – an SSRF bypass of the direct-literal check.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return (ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
 def _is_blocked_ip_literal(hostname: str) -> bool:
-    """True when the host is an IP literal in a non-public range (loopback, private, link-local,
-    reserved, multicast, unspecified). Domain names return False – we deliberately do not resolve
-    here, to keep the crawl path hermetic and fast. This blocks the direct-IP SSRF vectors
-    (notably cloud metadata at 169.254.169.254, and 127.0.0.1 / 10.x / 192.168.x)."""
+    """True when the host is an IP literal in a non-public range. Domain names return False
+    (they are resolved and checked by HttpFetcher._host_is_blocked, which can await DNS)."""
     try:
         ip = ipaddress.ip_address(hostname)
     except ValueError:
         return False
-    return (ip.is_loopback or ip.is_private or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    return _ip_is_blocked(ip)
 _META_CHARSET_RE = re.compile(rb"<meta[^>]+charset=[\"']?\s*([a-zA-Z0-9_-]+)", re.I)
 _XML_DECL_RE = re.compile(rb"<\?xml[^>]+encoding=[\"']([a-zA-Z0-9_-]+)", re.I)
 
@@ -108,6 +119,37 @@ class HttpFetcher:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def _host_is_blocked(self, hostname: str) -> bool:
+        """True when a request to this host must be refused (SSRF guard).
+
+        An IP literal is checked directly. A domain is resolved and blocked if ANY of its
+        addresses is in a non-public range, which closes the DNS-based bypass where a
+        public-looking hostname resolves to 127.0.0.1 / 169.254.169.254 / 10.x. DNS is resolved
+        off the event loop via the loop's resolver; a resolution failure fails closed (blocked),
+        since a host we cannot verify is a host we will not fetch.
+
+        Residual: this does not pin the resolved address, so a determined attacker rebinding DNS
+        between this lookup and httpx's own could still slip through. Pinning the connection to a
+        vetted IP would close that and is the next step if this becomes a real threat model."""
+        if not hostname:
+            return True
+        try:
+            return _ip_is_blocked(ipaddress.ip_address(hostname))
+        except ValueError:
+            pass  # not a literal: resolve it
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(hostname, None)
+        except (socket.gaierror, OSError) as exc:
+            log.warning("dns resolution failed for %s (%s); blocking", hostname, exc)
+            return True
+        for info in infos:
+            try:
+                if _ip_is_blocked(ipaddress.ip_address(info[4][0])):
+                    return True
+            except ValueError:
+                continue
+        return False
+
     async def __aenter__(self) -> "HttpFetcher":
         return self
 
@@ -178,8 +220,8 @@ class HttpFetcher:
         """`api=True` marks a programmatic endpoint (Overpass, search): robots.txt governs
         crawlers on websites, not API clients, so the check is skipped there."""
         host = urlparse(url).netloc.lower()
-        if self.settings.block_private_hosts and _is_blocked_ip_literal(urlparse(url).hostname or ""):
-            log.warning("blocked request to non-public IP host: %s", url)
+        if self.settings.block_private_hosts and await self._host_is_blocked(urlparse(url).hostname or ""):
+            log.warning("blocked request to non-public host: %s", url)
             return FetchResult(url, url, 0, "", "", error="blocked_private_host")
         if self._host_failures.get(host, 0) >= self.settings.host_failure_limit:
             return FetchResult(url, url, 0, "", "", error="host_unavailable")

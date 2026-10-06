@@ -206,6 +206,22 @@ async function accessToken(): Promise<string | null> {
   }
 }
 
+/** On a 401, sign out the stale local session and redirect to sign-in at most once per
+ * page-load. Shared by request() and the raw-fetch downloadExport so both honour the same
+ * one-shot guard; without it, a download hitting a persistent 401 (JWKS mismatch, clock skew)
+ * redirects on every call and loops. */
+async function handleUnauthorized(): Promise<void> {
+  if (typeof window === "undefined") return
+  // Sign out the stale local session so the middleware stops thinking we're
+  // authenticated (which would bounce /sign-in back to /dashboard → loop).
+  try { const sb = (await import("@/lib/supabase/client")).createClient(); await sb.auth.signOut() } catch { /* best effort */ }
+  const key = "__qualifyr_401_redirect"
+  if (!sessionStorage.getItem(key)) {
+    sessionStorage.setItem(key, "1")
+    window.location.assign(`/sign-in?next=${encodeURIComponent(window.location.pathname)}`)
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = await accessToken()
   const res = await fetch(`${API_URL}${path}`, {
@@ -218,18 +234,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     cache: "no-store",
   })
   if (!res.ok) {
-    if (res.status === 401 && typeof window !== "undefined") {
-      // Sign out the stale local session so the middleware stops thinking we're
-      // authenticated (which would bounce /sign-in back to /dashboard → loop).
-      try { const sb = (await import("@/lib/supabase/client")).createClient(); await sb.auth.signOut() } catch { /* best effort */ }
-      // Redirect once per page-load to avoid an infinite loop when the server
-      // keeps rejecting (e.g. JWKS mismatch, clock skew, misconfigured URL).
-      const key = "__qualifyr_401_redirect"
-      if (!sessionStorage.getItem(key)) {
-        sessionStorage.setItem(key, "1")
-        window.location.assign(`/sign-in?next=${encodeURIComponent(window.location.pathname)}`)
-      }
-    }
+    if (res.status === 401) await handleUnauthorized()
     let detail = res.statusText
     try { detail = (await res.json()).detail ?? detail } catch { /* not json */ }
     throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail))
@@ -254,7 +259,7 @@ export const api = {
   stats: (id: string) => request<Stats>(`/campaigns/${id}/stats`),
   leads: (id: string, q: { min_score?: number; company_type?: string; outreach_ready?: boolean; search?: string; order?: "recent" | "score"; limit?: number; offset?: number } = {}) => {
     const p = new URLSearchParams()
-    if (q.min_score) p.set("min_score", String(q.min_score))
+    if (q.min_score !== undefined) p.set("min_score", String(q.min_score))
     if (q.company_type) p.set("company_type", q.company_type)
     if (q.outreach_ready !== undefined) p.set("outreach_ready", String(q.outreach_ready))
     if (q.search) p.set("q", q.search)
@@ -281,9 +286,7 @@ export const api = {
       cache: "no-store",
     })
     if (!res.ok) {
-      if (res.status === 401 && typeof window !== "undefined") {
-        window.location.assign(`/sign-in?next=${encodeURIComponent(window.location.pathname)}`)
-      }
+      if (res.status === 401) await handleUnauthorized()
       let detail = res.statusText
       try { detail = (await res.json()).detail ?? detail } catch { /* not json */ }
       throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail))

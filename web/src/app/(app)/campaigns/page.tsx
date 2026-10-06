@@ -404,67 +404,84 @@ function split(s: string): string[] {
   return s.split(",").map((t) => t.trim()).filter(Boolean)
 }
 
+// A small YAML reader matched to toYaml's output: nested maps, block and inline lists, and
+// scalars, at ARBITRARY depth. An indentation stack (not a single "current key") is what lets
+// it read 3+ levels; the old two-level reader silently flattened anything deeper, so a config
+// that toYaml had emitted could not be read back.
 function parseYaml(text: string): Record<string, unknown> {
-  const obj: Record<string, unknown> = {}
-  let currentKey = ""
+  const root: Record<string, unknown> = {}
+  // Each frame owns the keys written at `indent`; the innermost frame is the current map.
+  const stack: { indent: number; map: Record<string, unknown> }[] = [{ indent: -1, map: root }]
+  // A bare `key:` whose shape (map, list, or empty) is only known once the next line is seen.
+  let pending: { key: string; parent: Record<string, unknown>; indent: number } | null = null
   let listTarget: unknown[] | null = null
+  let listIndent = -1
+
+  const parseVal = (s: string): unknown => {
+    if (s.startsWith("[") && s.endsWith("]"))
+      return s.slice(1, -1).split(",").map((t) => t.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean)
+    const n = Number(s)
+    if (!isNaN(n) && s.trim() !== "") return n
+    if (s === "true") return true
+    if (s === "false") return false
+    return s.replace(/^['"]|['"]$/g, "")
+  }
 
   for (const line of text.split("\n")) {
     const raw = line.trimEnd()
-    if (!raw || raw.startsWith("#")) continue
+    if (!raw || raw.trimStart().startsWith("#")) continue
     const indent = raw.length - raw.trimStart().length
     const content = raw.trimStart()
+    const isListItem = content.startsWith("- ")
 
-    if (content.startsWith("- ")) {
-      const val = content.slice(2).replace(/^['"]|['"]$/g, "")
-      if (listTarget) listTarget.push(val)
+    // Resolve a pending `key:` now that the following line reveals its shape.
+    if (pending) {
+      if (indent > pending.indent && isListItem) {
+        const arr: unknown[] = []
+        pending.parent[pending.key] = arr
+        listTarget = arr
+        listIndent = indent
+      } else if (indent > pending.indent) {
+        const child: Record<string, unknown> = {}
+        pending.parent[pending.key] = child
+        stack.push({ indent: pending.indent, map: child })
+      } else {
+        // No children followed: a bare `key:` means an empty list (toYaml never emits this; it
+        // only arises from hand-editing). Matches the previous reader's default.
+        pending.parent[pending.key] = []
+      }
+      pending = null
+    }
+
+    if (isListItem) {
+      if (listTarget && indent >= listIndent) {
+        listTarget.push(content.slice(2).trim().replace(/^['"]|['"]$/g, ""))
+      }
       continue
     }
 
-    const kvMatch = content.match(/^(\w[\w_]*):\s*(.*)/)
+    const kvMatch = content.match(/^(\w[\w-]*):\s*(.*)$/)
     if (!kvMatch) continue
     const [, k, v] = kvMatch
     listTarget = null
 
-    const parseVal = (s: string): unknown => {
-      if (s.startsWith("[") && s.endsWith("]"))
-        return s.slice(1, -1).split(",").map((t) => t.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean)
-      const n = Number(s)
-      if (!isNaN(n) && s.trim() !== "") return n
-      if (s === "true") return true
-      if (s === "false") return false
-      return s.replace(/^['"]|['"]$/g, "")
-    }
+    // Drop back to the container whose children live at this indent.
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop()
+    const parent = stack[stack.length - 1].map
 
-    if (indent === 0) {
-      currentKey = k
-      if (v === "" || v === "[]") {
-        const a: unknown[] = []
-        obj[k] = a
-        if (v !== "[]") listTarget = a
-      } else if (v === "{}") {
-        obj[k] = {}
-      } else {
-        obj[k] = parseVal(v)
-      }
-    } else if (currentKey) {
-      if (Array.isArray(obj[currentKey]) && (obj[currentKey] as unknown[]).length === 0) {
-        obj[currentKey] = {}
-      }
-      if (typeof obj[currentKey] !== "object" || Array.isArray(obj[currentKey])) obj[currentKey] = {}
-      const sub = obj[currentKey] as Record<string, unknown>
-      if (v === "" || v === "[]") {
-        const a: unknown[] = []
-        sub[k] = a
-        if (v !== "[]") listTarget = a
-      } else if (v === "{}") {
-        sub[k] = {}
-      } else {
-        sub[k] = parseVal(v)
-      }
+    if (v === "") {
+      pending = { key: k, parent, indent }
+    } else if (v === "[]") {
+      parent[k] = []
+    } else if (v === "{}") {
+      parent[k] = {}
+    } else {
+      parent[k] = parseVal(v)
     }
   }
-  return obj
+  // File ended on a bare `key:` with nothing under it.
+  if (pending) pending.parent[pending.key] = []
+  return root
 }
 
 function toYaml(obj: Record<string, unknown>, indent = 0): string {

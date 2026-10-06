@@ -231,19 +231,20 @@ def _is_unlimited(email: str | None) -> bool:
 
 @app.get("/health")
 def health() -> dict:
+    # /health is unauthenticated (it is the deploy/uptime probe), so it reports only booleans.
+    # Raw exception strings leak the DB host/port and internal stack traces to anyone on the
+    # internet; the detail is logged server-side instead, where operators can read it.
     o = load_outreach_settings()
     auth_ok = bool(os.environ.get("GTM_SUPABASE_URL", "").strip())
     jwks_ok = False
-    jwks_error = None
     if auth_ok:
         try:
             from gtm_engine.api.auth import jwk_client
             jwk_client()
             jwks_ok = True
         except Exception as exc:
-            jwks_error = str(exc)
+            log.warning("health: jwks unreachable: %s", exc)
     db_ok = False
-    db_error = None
     dsn = os.environ.get("GTM_DATABASE_URL", "")
     if dsn:
         try:
@@ -251,7 +252,7 @@ def health() -> dict:
             db.close()
             db_ok = True
         except Exception as exc:
-            db_error = str(exc)
+            log.warning("health: database unreachable: %s", exc)
     return {"status": "ok", "version": __version__, "smtp_configured": o.credentials_present,
             "auth_mode": o.auth_mode, "require_approval": o.require_approval,
             "warmup": {"enabled": o.warmup_enabled, "start": o.warmup_start_per_day,
@@ -259,10 +260,9 @@ def health() -> dict:
             "limits": {"max_campaigns": FREE_MAX_CAMPAIGNS,
                        "max_leads_per_campaign": FREE_MAX_LEADS_PER_CAMPAIGN},
             "auth": {"supabase_url_set": auth_ok, "jwks_reachable": jwks_ok,
-                     "jwks_error": jwks_error, "auth_disabled": auth_disabled()},
+                     "auth_disabled": auth_disabled()},
             "encryption_available": encryption_available(),
-            "database": {"connected": db_ok, "error": db_error,
-                         "dsn_set": bool(dsn.strip())}}
+            "database": {"connected": db_ok, "dsn_set": bool(dsn.strip())}}
 
 
 @app.get("/settings/limits")
@@ -864,8 +864,10 @@ def outreach_queue(campaign_id: str) -> dict:
 
 
 class DraftUpdate(BaseModel):
-    subject: str
-    body: str
+    # Bounded so a single draft can't be used to store megabytes in the drafts table. Generous
+    # versus any real email: a long subject and a multi-part body still fit comfortably.
+    subject: str = Field(max_length=2000)
+    body: str = Field(max_length=100_000)
 
 
 @app.get("/leads/{lead_id}/drafts/{step}", dependencies=[Depends(require_lead_access)])
@@ -1172,18 +1174,54 @@ class PreferenceBody(BaseModel):
     value: str
 
 
+_BLOCKED_PREF_PREFIXES = ("daily_limit_",)
+
+
 @app.put("/settings/preferences/{pref_key}")
 def set_preference(pref_key: str, body: PreferenceBody,
                    user_id: str | None = Depends(current_user_id)) -> dict:
     if not user_id:
         raise HTTPException(401, "sign in to save preferences")
+    if any(pref_key.startswith(p) for p in _BLOCKED_PREF_PREFIXES):
+        raise HTTPException(422, f"use PUT /settings/usage/{{resource}} to change usage limits")
+    if len(pref_key) > 100:
+        raise HTTPException(422, "preference key too long")
     db = _db()
-    db.set_preference(user_id, pref_key, body.value.strip())
+    db.set_preference(user_id, pref_key, body.value.strip()[:2000])
     db.close()
     return {"ok": True, "pref_key": pref_key}
 
 
 # -- User mailboxes (self-serve SMTP credentials) ----------------------------
+
+# Standard SMTP submission ports. Without a port allowlist the mailbox-test endpoint is an
+# SSRF primitive: any signed-in user could point it at an internal host:port and read the
+# connection banner / error to probe the private network.
+_ALLOWED_SMTP_PORTS = {25, 465, 587, 2525}
+
+
+def _validate_smtp_target(host: str, port: int) -> None:
+    """Reject an SMTP target that could be used to probe the internal network. The port must be
+    a real SMTP submission port, and the host must not resolve to a non-public address."""
+    import socket
+    from gtm_engine.scraping.fetcher import _ip_is_blocked
+
+    host = (host or "").strip()
+    if not host:
+        raise HTTPException(422, "smtp_host is required")
+    if port not in _ALLOWED_SMTP_PORTS:
+        raise HTTPException(422, f"smtp_port must be one of {sorted(_ALLOWED_SMTP_PORTS)}")
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except OSError:
+        raise HTTPException(422, f"could not resolve smtp_host '{host}'")
+    import ipaddress
+    for info in infos:
+        try:
+            if _ip_is_blocked(ipaddress.ip_address(info[4][0])):
+                raise HTTPException(422, "smtp_host resolves to a non-public address")
+        except ValueError:
+            continue
 
 
 class MailboxBody(BaseModel):
@@ -1214,6 +1252,7 @@ def save_user_mailbox(body: MailboxBody, user_id: str | None = Depends(current_u
     addr = body.address.strip().lower()
     if "@" not in addr:
         raise HTTPException(422, "invalid email address")
+    _validate_smtp_target(body.smtp_host, body.smtp_port)
     encrypted_pw = encrypt_key(body.password.strip()) if body.password.strip() else None
     db = _db()
     db.set_user_mailbox(user_id, addr, encrypted_pw, body.smtp_host, body.smtp_port,
@@ -1257,6 +1296,7 @@ def test_user_mailbox(body: MailboxBody) -> dict:
     pw = body.password.strip()
     if not addr or not pw:
         raise HTTPException(422, "address and password are required")
+    _validate_smtp_target(body.smtp_host, body.smtp_port)
     try:
         conn = smtplib.SMTP(body.smtp_host, body.smtp_port, timeout=15)
         conn.ehlo()

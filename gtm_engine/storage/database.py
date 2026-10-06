@@ -278,9 +278,14 @@ class Database:
         try:
             self.conn.commit()
         except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
-            # The in-flight transaction is lost, but recover the connection so the run continues.
-            log.warning("db commit failed on a lost connection (%s); reconnecting", exc)
+            # The in-flight transaction is lost and its writes are gone. Recover the connection
+            # so later operations can proceed, but re-raise: a silent return here would make
+            # save_lead (and every other writer) report success for data that never landed.
+            # The caller - the pipeline's per-company loop - logs and moves on; the lead is
+            # re-derivable on the next run, a silently dropped one is not.
+            log.warning("db commit failed on a lost connection (%s); reconnecting then raising", exc)
             self._reconnect()
+            raise
 
     def close(self) -> None:
         if self.dry_run:
@@ -321,7 +326,9 @@ class Database:
         return {r["campaign_id"] for r in self._execute("SELECT campaign_id FROM campaigns").fetchall()}
 
     def campaign_owner(self, campaign_id: str) -> str | None:
-        row = self._execute("SELECT owner_id FROM campaigns WHERE campaign_id = %s", (campaign_id,)).fetchone()
+        row = self._execute(
+            "SELECT owner_id FROM campaigns WHERE campaign_id = %s AND deleted_at IS NULL", (campaign_id,)
+        ).fetchone()
         return row["owner_id"] if row else None
 
     def delete_campaign(self, campaign_id: str) -> None:
@@ -515,9 +522,12 @@ class Database:
             sql += " AND outreach_ready = %s"
             params.append(int(outreach_ready))
         if q and q.strip():
-            # Free-text search over the serialized lead (name, domain, email, city, …).
-            sql += " AND data_json ILIKE %s"
-            params.append(f"%{q.strip()}%")
+            # Free-text search over the serialized lead (name, domain, email, city, …). Escape
+            # the LIKE metacharacters (\ % _) in the user's term so a query like "%" or "a_b"
+            # is matched literally instead of becoming a wildcard that scans/enumerates every row.
+            term = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql += " AND data_json ILIKE %s ESCAPE '\\'"
+            params.append(f"%{term}%")
         return sql, params
 
     def leads_by_status(self, campaign_id: str, statuses: list[str]) -> list[Lead]:
@@ -529,7 +539,9 @@ class Database:
         return [Lead.model_validate_json(r["data_json"]) for r in rows]
 
     def campaign_config(self, campaign_id: str) -> dict | None:
-        row = self._execute("SELECT config_json FROM campaigns WHERE campaign_id = %s", (campaign_id,)).fetchone()
+        row = self._execute(
+            "SELECT config_json FROM campaigns WHERE campaign_id = %s AND deleted_at IS NULL", (campaign_id,)
+        ).fetchone()
         return json.loads(row["config_json"]) if row else None
 
     def campaign_counts(self, campaign_id: str, min_score: int) -> dict:

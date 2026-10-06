@@ -12,6 +12,16 @@ from gtm_engine.enrichment.fieldclean import clean_reason, humanize_industry
 from gtm_engine.models import CSV_COLUMNS, Lead
 
 
+# Leading characters a spreadsheet treats as the start of a formula. A scraped company name
+# like `=cmd|'/c calc'!A1` or `+HYPERLINK(...)` would otherwise execute on open in Excel/Sheets
+# (CSV injection). Prefixing a single quote makes the cell display as literal text.
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize(text: str) -> str:
+    return "'" + text if text[:1] in _FORMULA_TRIGGERS else text
+
+
 def _cell(value) -> str:
     if value is None:
         return ""
@@ -20,8 +30,8 @@ def _cell(value) -> str:
     if isinstance(value, datetime):
         return value.isoformat(timespec="seconds")
     if isinstance(value, list):
-        return "; ".join(str(v) for v in value)
-    return str(value)
+        return _sanitize("; ".join(str(v) for v in value))
+    return _sanitize(str(value))
 
 
 def lead_row(lead: Lead) -> dict[str, str]:
