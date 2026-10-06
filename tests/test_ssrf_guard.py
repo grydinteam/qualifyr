@@ -1,6 +1,7 @@
-"""SSRF guard: the crawler must refuse non-public IP-literal hosts (cloud metadata, loopback,
-private ranges) and still allow public hosts. Hermetic – no DNS, no network: the guard works on
-IP literals only and short-circuits before any request is made."""
+"""SSRF guard: the crawler must refuse non-public hosts (cloud metadata, loopback, private
+ranges), including IPv6-mapped IPv4 literals, and still allow public hosts. These cases cover
+IP literals, which are decided without DNS; domain resolution (and its fail-open behaviour) is
+exercised by the fetcher's _host_is_blocked in the DB-backed scraping tests."""
 
 from gtm_engine.config.schema import EngineSettings
 from gtm_engine.scraping.fetcher import HttpFetcher, _is_blocked_ip_literal

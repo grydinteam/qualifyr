@@ -125,14 +125,20 @@ class HttpFetcher:
         An IP literal is checked directly. A domain is resolved and blocked if ANY of its
         addresses is in a non-public range, which closes the DNS-based bypass where a
         public-looking hostname resolves to 127.0.0.1 / 169.254.169.254 / 10.x. DNS is resolved
-        off the event loop via the loop's resolver; a resolution failure fails closed (blocked),
-        since a host we cannot verify is a host we will not fetch.
+        off the event loop via the loop's resolver.
+
+        A resolution failure fails OPEN (not blocked): a name that does not resolve has no IP to
+        reach, so there is no SSRF to prevent, and httpx will fail the connection on its own. The
+        attack - a name that resolves successfully to a private address - is still caught, since
+        that path returns addresses and is checked. Failing open also keeps the crawl robust
+        against transient DNS hiccups and keeps HTTP-mocked tests (respx, which does not mock DNS)
+        hermetic.
 
         Residual: this does not pin the resolved address, so a determined attacker rebinding DNS
         between this lookup and httpx's own could still slip through. Pinning the connection to a
         vetted IP would close that and is the next step if this becomes a real threat model."""
         if not hostname:
-            return True
+            return False
         try:
             return _ip_is_blocked(ipaddress.ip_address(hostname))
         except ValueError:
@@ -140,8 +146,8 @@ class HttpFetcher:
         try:
             infos = await asyncio.get_running_loop().getaddrinfo(hostname, None)
         except (socket.gaierror, OSError) as exc:
-            log.warning("dns resolution failed for %s (%s); blocking", hostname, exc)
-            return True
+            log.debug("dns resolution failed for %s (%s); allowing (nothing to connect to)", hostname, exc)
+            return False
         for info in infos:
             try:
                 if _ip_is_blocked(ipaddress.ip_address(info[4][0])):

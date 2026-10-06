@@ -172,10 +172,13 @@ class EngineSettings(BaseModel):
     per_company_timeout_s: float = 90.0
     concurrency: int = 4
     respect_robots: bool = True
-    # SSRF guard: refuse to fetch URLs whose host is a non-public IP literal (loopback, private,
-    # link-local, cloud-metadata). On for safety; a self-hoster crawling an internal mirror can
-    # turn it off. Domain names are not resolved here (keeps the crawl path hermetic); use
-    # network-level egress rules if you also need to stop domain->private-IP rebinding.
+    # SSRF guard: refuse to fetch URLs whose host is (or resolves to) a non-public address -
+    # loopback, private, link-local, cloud-metadata - including IPv6-mapped IPv4 forms. Domains
+    # are resolved and checked before the request, which stops a public-looking name that points
+    # at a private IP; resolution failures fail open (no address to reach = no SSRF). On for
+    # safety; a self-hoster crawling an internal mirror can turn it off. It does not pin the
+    # resolved address, so network-level egress rules are still the backstop against DNS
+    # rebinding between this check and the connection.
     block_private_hosts: bool = True
     # Render JS-only sites with headless Chromium when static HTTP returns an empty shell.
     # Needs the `browser` extra; off by default because no target site has needed it yet.
