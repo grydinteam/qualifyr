@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="1200" height="340" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="Qualifyr — describe what you sell, it finds the companies that actually need it">
+  <rect x="0.5" y="0.5" width="1199" height="339" rx="14" fill="#ffffff" stroke="#e5e5e5"/>
+
+  <!-- mark -->
+  <rect x="64" y="56" width="22" height="22" rx="5" fill="#0a0a0a"/>
+  <rect x="71" y="63" width="8" height="8" rx="2" fill="#ffffff"/>
+
+  <text x="64" y="150" font-size="58" font-weight="700" fill="#0a0a0a" letter-spacing="-2">Qualifyr</text>
+
+  <text x="66" y="196" font-size="21" font-weight="600" fill="#0a0a0a">Describe what you sell.</text>
+  <text x="66" y="224" font-size="21" font-weight="500" fill="#525252">It finds the companies that actually need it.</text>
+
+  <line x1="66" y1="258" x2="560" y2="258" stroke="#ececec"/>
+  <text x="66" y="286" font-size="13" fill="#737373" letter-spacing="0.2">Pakistan-first   ·   Open source, GPLv3   ·   Python · FastAPI · Next.js · Supabase</text>
+
+  <!-- leads card: the real output -->
+  <g>
+    <rect x="712" y="48" width="424" height="244" rx="12" fill="#ffffff" stroke="#e5e5e5"/>
+    <text x="736" y="82" font-size="13.5" font-weight="600" fill="#0a0a0a">Qualified buyers</text>
+    <text x="1112" y="82" font-size="13.5" font-weight="600" fill="#737373" text-anchor="end">38</text>
+    <line x1="736" y1="98" x2="1112" y2="98" stroke="#f0f0f0"/>
+
+    <g font-size="13.5">
+      <g transform="translate(0,0)">
+        <text x="736" y="130" font-weight="600" fill="#171717">Al-Karam Mega Store</text>
+        <text x="736" y="150" font-size="11.5" fill="#8a8a8a">Islamabad · no online ordering</text>
+        <rect x="1064" y="118" width="48" height="24" rx="6" fill="#0a0a0a"/>
+        <text x="1088" y="134.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle">92</text>
+      </g>
+      <g transform="translate(0,56)">
+        <text x="736" y="130" font-weight="600" fill="#171717">Madina Cash &amp; Carry</text>
+        <text x="736" y="150" font-size="11.5" fill="#8a8a8a">Rawalpindi · few Google reviews</text>
+        <rect x="1064" y="118" width="48" height="24" rx="6" fill="#171717"/>
+        <text x="1088" y="134.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle">85</text>
+      </g>
+      <g transform="translate(0,112)">
+        <text x="736" y="130" font-weight="600" fill="#171717">Green Valley Mart</text>
+        <text x="736" y="150" font-size="11.5" fill="#8a8a8a">Islamabad · no delivery platform</text>
+        <rect x="1063" y="118" width="48" height="24" rx="6" fill="#ffffff" stroke="#d4d4d4"/>
+        <text x="1087" y="134.5" font-size="12.5" font-weight="700" fill="#525252" text-anchor="middle">78</text>
+      </g>
+    </g>
+  </g>
+</svg>
