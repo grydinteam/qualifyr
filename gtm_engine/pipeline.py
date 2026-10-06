@@ -173,6 +173,9 @@ def _discovery_relevance_filter(
         if user_configured_categories and c.category and c.category in cats:
             kept.append(c)
             continue
+        # A missing category keeps the company: untagged OSM POIs are common and dropping them
+        # here costs real recall (the full qualification pipeline still vets them downstream).
+        # This is a deliberate recall-over-precision choice - see test_discovery_relevance_filter_passes_no_category.
         if not c.category:
             kept.append(c)
             continue
@@ -795,7 +798,8 @@ class Pipeline:
 
         score = score_lead(ScoreInputs(company, cls, quality, contact, signals, online_presence, self.settings), campaign)
         ready = is_outreach_ready(cls, score, contact, campaign)
-        suppressed = await self._db_call(self.db.is_suppressed, domain, contact.email)
+        suppressed = await self._db_call(self.db.is_suppressed, domain, contact.email,
+                                         owner_id=getattr(self, "_owner_id", None))
         if suppressed:
             ready = False
             stats.suppressed += 1
@@ -940,6 +944,10 @@ class Pipeline:
         stats = RunStats()
         self.db.upsert_campaign(campaign.campaign_id, campaign.name, campaign.model_dump(mode="json"))
         self.db.start_run(run_id, campaign.campaign_id)
+        # The tenant this campaign belongs to, so the suppression check skips only this account's
+        # do-not-contact list (plus the shared '' scope), never another tenant's. None for
+        # file-based examples and legacy shared campaigns, which use the shared scope.
+        self._owner_id = self.db.campaign_owner(campaign.campaign_id)
         self._relevance_keywords = await self._build_relevance_keywords(campaign)
         for ind in campaign.target_industries:
             for word in ind.lower().split():

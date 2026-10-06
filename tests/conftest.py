@@ -75,6 +75,19 @@ def pg_schema():
             conn.execute(f'DROP SCHEMA IF EXISTS "{name}" CASCADE')
 
 
+def pytest_configure(config):
+    # Make the DB-test skip loud: without a DSN, ~160 tests silently skip, so a developer can
+    # "pass" the suite locally while shipping broken DB code. A config-time warning surfaces it.
+    if not TEST_DSN:
+        config.issue_config_time_warning(
+            pytest.PytestConfigWarning(
+                "GTM_TEST_DATABASE_URL (or GTM_DATABASE_URL) is not set: all DB-backed tests "
+                "will be SKIPPED. Set it to a throwaway Postgres to run the full suite."
+            ),
+            stacklevel=2,
+        )
+
+
 def fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
 

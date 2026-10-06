@@ -537,6 +537,8 @@ def _merge_llm(draft: CampaignDraft, llm_fields: dict) -> None:
 
     if not draft.max_companies and llm_fields.get("max_companies"):
         try:
-            draft.max_companies = int(llm_fields["max_companies"])
+            # Clamp the LLM-supplied value: an unbounded int() lets a hallucinated 999999 drive
+            # the crawl into resource exhaustion. 5000 matches the deterministic path's ceiling.
+            draft.max_companies = max(1, min(int(llm_fields["max_companies"]), 5000))
         except (ValueError, TypeError):
             pass

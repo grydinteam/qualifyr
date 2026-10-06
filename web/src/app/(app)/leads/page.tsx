@@ -27,16 +27,22 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
 function LeadDetail({ leadId, onClose, onChanged }: { leadId: string | null; onClose: () => void; onChanged: () => void }) {
   const [lead, setLead] = React.useState<Lead | null>(null)
   const [expanded, setExpanded] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
   React.useEffect(() => {
-    if (!leadId) { setLead(null); return }
-    api.lead(leadId).then(setLead).catch(() => setLead(null))
+    if (!leadId) { setLead(null); setError(null); return }
+    setError(null)
+    api.lead(leadId).then(setLead).catch((e) => { setLead(null); setError((e as Error).message) })
   }, [leadId])
 
   const suppress = async () => {
     if (!lead || !confirm(`Never contact ${lead.company_name} again?`)) return
-    await api.suppress(lead.lead_id, "suppressed from UI")
-    onChanged()
-    onClose()
+    try {
+      await api.suppress(lead.lead_id, "suppressed from UI")
+      onChanged()
+      onClose()
+    } catch (e) {
+      setError((e as Error).message)
+    }
   }
 
   return (
@@ -54,6 +60,9 @@ function LeadDetail({ leadId, onClose, onChanged }: { leadId: string | null; onC
         <SheetHeader>
           <SheetTitle>{lead?.company_name ?? "…"}</SheetTitle>
         </SheetHeader>
+        {error && (
+          <p className="mx-4 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-sm text-destructive" role="alert">{error}</p>
+        )}
         {lead && (
           <div className="flex flex-col gap-4 p-4 pt-0">
             <div className="flex flex-wrap gap-2">

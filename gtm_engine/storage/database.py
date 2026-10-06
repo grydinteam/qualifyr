@@ -87,12 +87,33 @@ CREATE INDEX IF NOT EXISTS idx_leads_company ON leads(company_key);
 CREATE INDEX IF NOT EXISTS idx_leads_campaign_updated ON leads(campaign_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_leads_campaign_score ON leads(campaign_id, total_score DESC);
 
+-- Per-tenant do-not-contact list. owner_id scopes a suppression to the account that created it;
+-- '' is the shared/global scope (CLI/operator adds, legacy rows) that applies to everyone. The
+-- PK is (owner_id, value) so two tenants can independently suppress the same value without one
+-- clobbering the other.
 CREATE TABLE IF NOT EXISTS suppressions (
-    value TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
     kind TEXT NOT NULL,
     reason TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    owner_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (owner_id, value)
 );
+-- Migrate pre-tenant databases: add owner_id, then move the primary key from (value) to
+-- (owner_id, value). Guarded so it runs once and is a no-op on a database already migrated or
+-- freshly created with the composite key.
+ALTER TABLE suppressions ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT '';
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+        WHERE i.indrelid = 'suppressions'::regclass AND i.indisprimary AND a.attname = 'owner_id'
+    ) THEN
+        ALTER TABLE suppressions DROP CONSTRAINT IF EXISTS suppressions_pkey;
+        ALTER TABLE suppressions ADD PRIMARY KEY (owner_id, value);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS drafts (
     lead_id TEXT NOT NULL,
@@ -166,6 +187,14 @@ CREATE TABLE IF NOT EXISTS hidden_campaigns (
     campaign_id TEXT PRIMARY KEY,
     hidden_at TEXT NOT NULL
 );
+
+-- Foreign-key lookups that have no index scan the whole table as a campaign/lead accumulates
+-- rows. Added here so the activity feed, run history, and per-campaign company counts stay fast.
+CREATE INDEX IF NOT EXISTS idx_runs_campaign ON runs(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_companies_campaign ON companies(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_pages_company ON pages(company_key);
+CREATE INDEX IF NOT EXISTS idx_events_lead ON outreach_events(lead_id);
+CREATE INDEX IF NOT EXISTS idx_events_type_created ON outreach_events(event_type, created_at);
 """
 
 
@@ -189,7 +218,13 @@ def _search_path_of(dsn: str) -> str | None:
     for value in urllib.parse.parse_qs(query).get("options", []):
         match = re.search(r"-c\s*search_path\s*=\s*([^\s,]+)", value)
         if match:
-            return match.group(1)
+            schema = match.group(1)
+            # Defence in depth: this value is interpolated into `SET search_path TO "..."`, so
+            # restrict it to a plain SQL identifier. The DSN is operator-controlled today, but a
+            # non-identifier here is either a misconfiguration or an injection attempt.
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
+                raise ValueError(f"unsafe search_path schema in DSN: {schema!r}")
+            return schema
     return None
 
 
@@ -406,11 +441,13 @@ class Database:
     def upsert_company(self, company_key: str, campaign_id: str, name: str, *,
                        domain: str | None, website: str | None, country: str | None,
                        city: str | None, source: str, source_url: str | None, raw: dict) -> bool:
-        """Returns True if the company was new for this campaign."""
-        exists = self._execute(
-            "SELECT 1 FROM companies WHERE company_key = %s", (company_key,)
-        ).fetchone()
-        self._execute(
+        """Returns True if the company was new for this campaign.
+
+        Insert-or-update and the new/existing verdict are one atomic statement: the old
+        SELECT-then-INSERT let two concurrent discoveries both read "absent" and both count the
+        company as new, inflating discovery stats. `xmax = 0` is true only for the row this
+        statement just inserted, so it distinguishes a fresh insert from a conflict update."""
+        row = self._execute(
             "INSERT INTO companies (company_key, campaign_id, name, domain, website, "
             "country, city, source, source_url, discovered_at, raw_json) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
@@ -418,12 +455,13 @@ class Database:
             "name = EXCLUDED.name, domain = EXCLUDED.domain, website = EXCLUDED.website, "
             "country = EXCLUDED.country, city = EXCLUDED.city, source = EXCLUDED.source, "
             "source_url = EXCLUDED.source_url, discovered_at = EXCLUDED.discovered_at, "
-            "raw_json = EXCLUDED.raw_json",
+            "raw_json = EXCLUDED.raw_json "
+            "RETURNING (xmax = 0) AS inserted",
             (company_key, campaign_id, name, domain, website, country, city, source,
              source_url, utcnow().isoformat(), json.dumps(raw, default=str)),
-        )
+        ).fetchone()
         self._commit()
-        return exists is None
+        return bool(row["inserted"])
 
     # -- pages --------------------------------------------------------------
 
@@ -660,22 +698,34 @@ class Database:
 
     # -- suppressions ---------------------------------------------------------
 
-    def add_suppression(self, value: str, kind: str, reason: str | None = None) -> None:
+    def add_suppression(self, value: str, kind: str, reason: str | None = None,
+                        owner_id: str | None = None) -> None:
+        """Suppress a value for one tenant. owner_id None (local operator / CLI / no auth) stores
+        it in the shared '' scope that applies to everyone; a real user id scopes it to them."""
         self._execute(
-            "INSERT INTO suppressions (value, kind, reason, created_at) VALUES (%s, %s, %s, %s) "
-            "ON CONFLICT (value) DO UPDATE SET kind = EXCLUDED.kind, reason = EXCLUDED.reason, "
+            "INSERT INTO suppressions (value, kind, reason, created_at, owner_id) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (owner_id, value) DO UPDATE SET kind = EXCLUDED.kind, reason = EXCLUDED.reason, "
             "created_at = EXCLUDED.created_at",
-            (value.lower().strip(), kind, reason, utcnow().isoformat()),
+            (value.lower().strip(), kind, reason, utcnow().isoformat(), owner_id or ""),
         )
         self._commit()
 
-    def is_suppressed(self, *values: str | None) -> bool:
+    def is_suppressed(self, *values: str | None, owner_id: str | None = None) -> bool:
+        """True if any value is suppressed. With owner_id set (hosted multi-tenant), only that
+        tenant's own suppressions and the shared '' scope count, so one tenant's list never
+        silences another's outreach. owner_id None (local operator) matches any scope."""
         vals = [v.lower().strip() for v in values if v]
         if not vals:
             return False
         placeholders = ",".join("%s" for _ in vals)
+        if owner_id is None:
+            return self._execute(
+                f"SELECT 1 FROM suppressions WHERE value IN ({placeholders}) LIMIT 1", vals
+            ).fetchone() is not None
         return self._execute(
-            f"SELECT 1 FROM suppressions WHERE value IN ({placeholders}) LIMIT 1", vals
+            f"SELECT 1 FROM suppressions WHERE value IN ({placeholders}) AND owner_id IN (%s, '') LIMIT 1",
+            [*vals, owner_id],
         ).fetchone() is not None
 
     # -- drafts (human approval) ----------------------------------------------
@@ -710,11 +760,25 @@ class Database:
     def drafts_by_status(self, status: str) -> list[dict]:
         return [dict(r) for r in self._execute("SELECT * FROM drafts WHERE status = %s ORDER BY created_at", (status,))]
 
-    def list_suppressions(self) -> list[dict]:
-        return [dict(r) for r in self._execute("SELECT * FROM suppressions ORDER BY created_at DESC")]
+    def list_suppressions(self, owner_id: str | None = None) -> list[dict]:
+        """With owner_id, only that tenant's own suppressions plus the shared '' scope; without it
+        (local operator), all of them."""
+        if owner_id is None:
+            return [dict(r) for r in self._execute("SELECT * FROM suppressions ORDER BY created_at DESC")]
+        return [dict(r) for r in self._execute(
+            "SELECT * FROM suppressions WHERE owner_id IN (%s, '') ORDER BY created_at DESC", (owner_id,)
+        )]
 
-    def remove_suppression(self, value: str) -> bool:
-        cur = self._execute("DELETE FROM suppressions WHERE value = %s", (value.lower().strip(),))
+    def remove_suppression(self, value: str, owner_id: str | None = None) -> bool:
+        """A tenant can only remove its own suppressions, never the shared '' compliance scope.
+        owner_id None (local operator) can remove any."""
+        if owner_id is None:
+            cur = self._execute("DELETE FROM suppressions WHERE value = %s", (value.lower().strip(),))
+        else:
+            cur = self._execute(
+                "DELETE FROM suppressions WHERE value = %s AND owner_id = %s",
+                (value.lower().strip(), owner_id),
+            )
         self._commit()
         return cur.rowcount > 0
 

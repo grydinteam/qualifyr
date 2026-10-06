@@ -198,10 +198,14 @@ export default function OutreachPage() {
 
   const load = React.useCallback(async () => {
     if (!campaignId) return
-    try {
-      const [q, s, a] = await Promise.all([api.queue(campaignId), api.sequence(campaignId), api.activity(campaignId)])
-      setQueue(q); setSequence(s); setActivity(a); setError(null)
-    } catch (e) { setError((e as Error).message) }
+    // allSettled, not all: a failure in one panel (e.g. activity) must not throw away the queue
+    // and sequence that loaded fine. Each result is applied on its own; only the failures surface.
+    const [q, s, a] = await Promise.allSettled([api.queue(campaignId), api.sequence(campaignId), api.activity(campaignId)])
+    if (q.status === "fulfilled") setQueue(q.value)
+    if (s.status === "fulfilled") setSequence(s.value)
+    if (a.status === "fulfilled") setActivity(a.value)
+    const failed = [q, s, a].filter((r) => r.status === "rejected") as PromiseRejectedResult[]
+    setError(failed.length ? (failed[0].reason as Error).message : null)
   }, [campaignId])
   React.useEffect(() => { load() }, [load])
 

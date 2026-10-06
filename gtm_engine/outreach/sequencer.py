@@ -70,13 +70,14 @@ def enqueue(db: Database, campaign_id: str, settings: OutreachSettings, ledger: 
             now: datetime | None = None) -> list[Lead]:
     now = now or utcnow()
     queued: list[Lead] = []
+    owner_id = db.campaign_owner(campaign_id)  # scope suppression checks to this campaign's tenant
     for lead in db.list_leads(campaign_id, outreach_ready=True):
         ok, why = eligible(lead, settings)
         if not ok:
             log.debug("skip %s: %s", lead.company_name, why)
             continue
         email = lead.contact_email
-        if db.is_suppressed(lead.domain, email) or ledger.is_stopped(email):
+        if db.is_suppressed(lead.domain, email, owner_id=owner_id) or ledger.is_stopped(email):
             lead.sequence_status = SequenceStatus.SUPPRESSED
             db.update_lead(lead)
             continue
@@ -146,7 +147,10 @@ def stop_lead(db: Database, lead: Lead, status: SequenceStatus, reason: str, led
     db.update_lead(lead)
     db.add_event(lead.lead_id, status.value, detail=reason)
     if status in (SequenceStatus.UNSUBSCRIBED, SequenceStatus.BOUNCED) and lead.contact_email:
-        db.add_suppression(lead.contact_email, "email", reason)
+        # Scope the suppression to the campaign's tenant so an unsubscribe/bounce in one
+        # account's outreach does not silence that address for every other account.
+        db.add_suppression(lead.contact_email, "email", reason,
+                           owner_id=db.campaign_owner(lead.campaign_id))
         if ledger:
             ledger.record_stop(lead.contact_email, status.value)
 
@@ -178,6 +182,7 @@ def send_due(db: Database, campaign: CampaignConfig, settings: OutreachSettings,
 
     batch_left = limit if limit is not None else 10**9
     consecutive_failures = 0
+    owner_id = db.campaign_owner(campaign.campaign_id)  # scope suppression checks to this tenant
     for lead in due_leads(db, campaign.campaign_id, now):
         if batch_left <= 0:
             report.stopped_reason = "batch limit reached"
@@ -187,7 +192,7 @@ def send_due(db: Database, campaign: CampaignConfig, settings: OutreachSettings,
             break
         step, next_status = NEXT_STEP[lead.sequence_status]
         email = lead.contact_email
-        if db.is_suppressed(lead.domain, email) or ledger.is_stopped(email):
+        if db.is_suppressed(lead.domain, email, owner_id=owner_id) or ledger.is_stopped(email):
             stop_lead(db, lead, SequenceStatus.SUPPRESSED, "suppressed before send", ledger)
             report.skipped += 1
             continue

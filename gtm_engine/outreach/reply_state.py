@@ -212,7 +212,8 @@ def apply_inbound(db: Database, campaign_id: str, messages: list[InboundMessage]
             report.unsubscribed += 1
         elif c.label == "not_interested":
             stop_lead(db, lead, SequenceStatus.REPLIED, f"not interested: {c.matched}", ledger)
-            db.add_suppression(lead.contact_email, "email", "replied not interested")
+            db.add_suppression(lead.contact_email, "email", "replied not interested",
+                               owner_id=db.campaign_owner(lead.campaign_id))
             report.not_interested += 1
         elif c.label == "wrong_person":
             if c.referred_email:

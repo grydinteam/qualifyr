@@ -417,6 +417,14 @@ function parseYaml(text: string): Record<string, unknown> {
   let listTarget: unknown[] | null = null
   let listIndent = -1
 
+  // Strip a trailing "# comment" from an unquoted scalar (a hand-edit; toYaml quotes any value
+  // containing '#', so a quoted/bracketed value is left untouched and keeps its literal '#').
+  const stripComment = (s: string): string => {
+    if (/^['"[{]/.test(s)) return s
+    const i = s.indexOf(" #")
+    return i >= 0 ? s.slice(0, i).trimEnd() : s
+  }
+
   const parseVal = (s: string): unknown => {
     if (s.startsWith("[") && s.endsWith("]"))
       return s.slice(1, -1).split(",").map((t) => t.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean)
@@ -462,7 +470,8 @@ function parseYaml(text: string): Record<string, unknown> {
 
     const kvMatch = content.match(/^(\w[\w-]*):\s*(.*)$/)
     if (!kvMatch) continue
-    const [, k, v] = kvMatch
+    const [, k, rawV] = kvMatch
+    const v = stripComment(rawV)
     listTarget = null
 
     // Drop back to the container whose children live at this indent.

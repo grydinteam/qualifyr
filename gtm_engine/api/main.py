@@ -50,10 +50,22 @@ log = logging.getLogger(__name__)
 _docs = {} if auth_disabled() else {"docs_url": None, "redoc_url": None, "openapi_url": None}
 app = FastAPI(title="GTM Lead Engine", version=__version__,
               dependencies=[Depends(verify_request)], **_docs)
-_extra_origins = [o.strip() for o in os.environ.get("GTM_CORS_ORIGINS", "").split(",") if o.strip()]
+# Explicit allow-list only. A bare "*" is rejected (and logged) rather than passed through:
+# combined with credentialed requests it would let any site on the internet call the API with
+# the user's cookies. Operators name their real frontend origins in GTM_CORS_ORIGINS instead.
+_extra_origins = []
+for o in os.environ.get("GTM_CORS_ORIGINS", "").split(","):
+    o = o.strip()
+    if not o:
+        continue
+    if o == "*":
+        log.warning("ignoring '*' in GTM_CORS_ORIGINS: list explicit origins, not a wildcard")
+        continue
+    _extra_origins.append(o)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", *_extra_origins],
+    allow_credentials=False,
     allow_methods=["*"], allow_headers=["*"],
 )
 
@@ -425,6 +437,10 @@ async def create_campaign_nl(body: CampaignNLRequest, user_id: str | None = Depe
         db.close()
         raise HTTPException(403, f"Free tier is limited to {FREE_MAX_CAMPAIGNS} campaigns. "
                                  "Delete one to create another.")
+    # Rate-limit the parse itself: each call may run an LLM. Unlimited for local/master accounts.
+    if user_id is not None and not _is_unlimited(email) and not check_usage(db, user_id, "nl"):
+        db.close()
+        raise HTTPException(429, "Daily natural-language campaign limit reached – try again tomorrow.")
     existing = db.all_campaign_ids() | set(_campaign_files().keys())
 
     llm = build_llm(_settings) if _settings.enable_llm else None
@@ -589,10 +605,12 @@ def suppress(lead_id: str, req: SuppressRequest) -> dict:
     if not l:
         db.close()
         raise HTTPException(404, "lead not found")
+    # Scope to the campaign's tenant so suppressing a lead never touches another account's list.
+    owner = db.campaign_owner(l.campaign_id)
     if l.domain:
-        db.add_suppression(l.domain, "domain", req.reason or "suppressed from UI")
+        db.add_suppression(l.domain, "domain", req.reason or "suppressed from UI", owner_id=owner)
     if l.contact_email:
-        db.add_suppression(l.contact_email, "email", req.reason or "suppressed from UI")
+        db.add_suppression(l.contact_email, "email", req.reason or "suppressed from UI", owner_id=owner)
     stop_lead(db, l, SequenceStatus.SUPPRESSED, req.reason or "suppressed from UI", _read_only_ledger(l.campaign_id))
     db.close()
     return {"ok": True}
@@ -601,33 +619,37 @@ def suppress(lead_id: str, req: SuppressRequest) -> dict:
 # -- settings: suppressions, mailboxes, campaign YAML, sheets -----------------------------
 
 @app.get("/suppressions")
-def list_suppressions() -> list[dict]:
+def list_suppressions(user_id: str | None = Depends(current_user_id)) -> list[dict]:
+    # Scoped to the caller: a signed-in user sees only their own suppressions plus the shared
+    # scope, never another tenant's. Local operators (no auth) see all.
     db = _db()
-    rows = db.list_suppressions()
+    rows = db.list_suppressions(owner_id=user_id)
     db.close()
     return rows
 
 
 class SuppressionCreate(BaseModel):
-    value: str
-    reason: str | None = None
+    value: str = Field(min_length=1, max_length=320)
+    reason: str | None = Field(default=None, max_length=500)
 
 
 @app.post("/suppressions")
-def add_suppression(req: SuppressionCreate) -> dict:
+def add_suppression(req: SuppressionCreate, user_id: str | None = Depends(current_user_id)) -> dict:
     value = req.value.strip().lower()
     if not value:
         raise HTTPException(422, "empty value")
     db = _db()
-    db.add_suppression(value, "email" if "@" in value else "domain", req.reason or "added from UI")
+    db.add_suppression(value, "email" if "@" in value else "domain",
+                       req.reason or "added from UI", owner_id=user_id)
     db.close()
     return {"ok": True, "value": value}
 
 
 @app.delete("/suppressions/{value}")
-def delete_suppression(value: str) -> dict:
+def delete_suppression(value: str, user_id: str | None = Depends(current_user_id)) -> dict:
+    # A user can only remove their own suppressions, never another tenant's or the shared scope.
     db = _db()
-    removed = db.remove_suppression(value)
+    removed = db.remove_suppression(value, owner_id=user_id)
     db.close()
     if not removed:
         raise HTTPException(404, "not suppressed")
@@ -1085,6 +1107,9 @@ def test_api_key(key_name: str, user_id: str | None = Depends(current_user_id)) 
     if key_name not in ALLOWED_KEYS:
         raise HTTPException(422, f"unknown key: {key_name}")
     db = _db()
+    if not check_usage(db, user_id, "key_test"):
+        db.close()
+        raise HTTPException(429, "Daily API-key test limit reached – try again tomorrow.")
     encrypted = db.get_user_key(user_id, key_name)
     db.close()
     if not encrypted:
@@ -1289,13 +1314,19 @@ def toggle_user_mailbox(address: str, user_id: str | None = Depends(current_user
 
 
 @app.post("/settings/mailboxes/test")
-def test_user_mailbox(body: MailboxBody) -> dict:
+def test_user_mailbox(body: MailboxBody, user_id: str | None = Depends(current_user_id)) -> dict:
     """Test SMTP connection without saving. Returns ok + message."""
     import smtplib
     addr = body.address.strip().lower()
     pw = body.password.strip()
     if not addr or not pw:
         raise HTTPException(422, "address and password are required")
+    if user_id is not None:
+        db = _db()
+        allowed = check_usage(db, user_id, "smtp_test")
+        db.close()
+        if not allowed:
+            raise HTTPException(429, "Daily mailbox-test limit reached – try again tomorrow.")
     _validate_smtp_target(body.smtp_host, body.smtp_port)
     try:
         conn = smtplib.SMTP(body.smtp_host, body.smtp_port, timeout=15)

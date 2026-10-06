@@ -19,6 +19,11 @@ DEFAULT_LIMITS: dict[str, int] = {
     # one-run-at-a-time guard. On grydinteam (open-source) all runs share the repo's GitHub
     # Actions minutes, so this is tight by design.
     "runs": 3,
+    # Per-user daily caps on the endpoints that each cost something on every call - an LLM parse,
+    # an outbound SMTP connection, an outbound API probe - so none can be hammered unbounded.
+    "nl": 20,
+    "smtp_test": 30,
+    "key_test": 30,
 }
 
 
