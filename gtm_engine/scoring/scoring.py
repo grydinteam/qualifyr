@@ -208,11 +208,23 @@ def score_lead(inputs: ScoreInputs, campaign: CampaignConfig) -> ScoreBreakdown:
 
 
 def is_outreach_ready(cls: Classification, score: ScoreBreakdown, contact: Contact, campaign: CampaignConfig) -> bool:
-    """The only gate that lets a lead into the outreach queue."""
-    return (
+    """Whether a qualified buyer is actually reachable.
+
+    A usable contact is a deliverable email OR a phone number. Phone matters because most SMBs
+    in this market (shops, clinics, retailers) publish a number and run on call / WhatsApp, while
+    the companies that score highest on online-gap are precisely the ones least likely to expose a
+    scrapeable email — so an email-only gate marked almost every qualified lead unreachable.
+
+    The email sequencer requires a usable email on its own (see outreach.sequencer.eligible), so a
+    phone-only lead is surfaced as reachable here but is never auto-emailed; it is a call/WhatsApp
+    lead for the operator."""
+    if not (
         cls.company_type == CompanyType.BUYER
         and score.total >= campaign.min_score
         and score.priority in (Priority.HIGH, Priority.QUALIFIED)
-        and contact.email is not None
-        and contact.email_status in (EmailStatus.MX_VALID, EmailStatus.GENERIC, EmailStatus.DELIVERABLE)
-    )
+    ):
+        return False
+    has_email = contact.email is not None and contact.email_status in (
+        EmailStatus.MX_VALID, EmailStatus.GENERIC, EmailStatus.DELIVERABLE)
+    has_phone = bool(contact.phone)
+    return has_email or has_phone
